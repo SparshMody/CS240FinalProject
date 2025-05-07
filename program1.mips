@@ -1,0 +1,4 @@
+LOADI $t1, 5
+LOADI $t2, 10
+ADD $t3, $t1, $t2
+PRINT $t3

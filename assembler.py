@@ -1,4 +1,4 @@
-import sys
+ximport sys
 import os
 op_codes = {
 "add": "000000",
