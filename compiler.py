@@ -1,126 +1,108 @@
-memoryAddress = 5000
-tRegister = 0
-vars = dict()
+#!/usr/bin/env python3
+import re, sys
 
-def getInstructionLine(varName):
-    global memoryAddress, tRegister
-    tRegisterName = f"$t{tRegister}"
-    setVariableRegister(varName, tRegisterName)
-    result = f"addi {tRegisterName}, $zero, {memoryAddress}"
-    tRegister += 1
-    memoryAddress += 4
-    return result
+# ─── Globals ────────────────────────────────────────────────────────────────
+vars_        = set()
+reg_counter  = 0                      # cycle through $t0–$t7
 
-def setVariableRegister(varName, tRegister):
-    global vars
-    vars[varName] = tRegister
+def next_reg():
+    global reg_counter
+    r = f"$t{reg_counter}"
+    reg_counter = (reg_counter + 1) & 7
+    return r
 
-def getVariableRegister(varName):
-    global vars
-    return vars.get(varName, "ERROR")
+# ─── Helper: load constant or variable into a fresh register ───────────────
+def load(val):
+    r = next_reg()
+    if val.isdigit():
+        return [f"loadi {r}, {val}"], r
+    return [f"loadi {r}, {val}"], r             # treat val as variable name
 
-def getAssignmentLinesImmediateValue(val, varName):
-    global tRegister
-    return f"""addi $t{tRegister}, $zero, {val}
-sw $t{tRegister}, 0({getVariableRegister(varName)})""" + "\n"
+# ─── Build code for  var = expr  (now supports <<  >>) ─────────────────────
+def handle_assignment(var, expr):
+    out = []
 
-def getAssignmentLinesVariable(varSource, varDest):
-    global tRegister
-    registerSource = getVariableRegister(varSource)
-    registerDest = getVariableRegister(varDest)
-    return f"""lw $t{tRegister}, 0({registerSource})
-sw $t{tRegister}, 0({registerDest})""" + "\n"
+    # Shift-left  (A << imm)
+    m = re.match(r'(.+?)<<(.*)', expr)
+    if m:
+        left, amt = m.group(1).strip(), m.group(2).strip()
+        code_src, r_src = load(left)
+        r_dst = next_reg()
+        out += code_src + [f"shiftleft {r_dst}, {r_src}, {amt}",
+                           f"storei {r_dst}, {var}"]
+        return out
 
-def getArithmeticAssignment(line):
-    global tRegister
-    varName, _, expr = line.partition("=")
-    varName = varName.strip()
-    expr = expr.strip().strip(";")
-    
-    if "+" in expr:
-        left, right = expr.split("+")
-        op = "add"
-    elif "-" in expr:
-        left, right = expr.split("-")
-        op = "sub"
-    elif "*" in expr:
-        left, right = expr.split("*")
-        op = "mul"
-    elif "/" in expr:
-        left, right = expr.split("/")
-        op = "div"
-    else:
-        return ""
+    # Shift-right (A >> imm)
+    m = re.match(r'(.+?)>>(.*)', expr)
+    if m:
+        left, amt = m.group(1).strip(), m.group(2).strip()
+        code_src, r_src = load(left)
+        r_dst = next_reg()
+        out += code_src + [f"shiftright {r_dst}, {r_src}, {amt}",
+                           f"storei {r_dst}, {var}"]
+        return out
 
-    left, right = left.strip(), right.strip()
+    # Arithmetic + - * /
+    m = re.match(r'(.+?)([+\-*/])(.+)', expr)
+    if m:
+        lhs, op, rhs = m.group(1).strip(), m.group(2), m.group(3).strip()
+        opmap = {"+":"ADD","-":"SUB","*":"MUL","/":"DIV"}
+        c1,r1 = load(lhs)
+        c2,r2 = load(rhs)
+        r3    = next_reg()
+        out += c1 + c2 + [f"{opmap[op]} {r3}, {r1}, {r2}",
+                          f"storei {r3}, {var}"]
+        return out
 
-    code = ""
-    code += f"lw $t{tRegister}, 0({getVariableRegister(left)})\n"
-    code += f"lw $t{tRegister+1}, 0({getVariableRegister(right)})\n"
-    code += f"{op} $t{tRegister+2}, $t{tRegister}, $t{tRegister+1}\n"
-    code += f"sw $t{tRegister+2}, 0({getVariableRegister(varName)})\n"
-    tRegister += 3
-    return code
+    # Immediate or var copy
+    c,r = load(expr)
+    out += c + [f"storei {r}, {var}"]
+    return out
 
-def getIfStatement(expr):
-    global tRegister
-    expr = expr.strip("(){")
-    if "<" in expr:
-        left, right = expr.split("<")
-        op = "slt"
-    elif ">" in expr:
-        left, right = expr.split(">")
-        op = "sgt"
-    elif "==" in expr:
-        left, right = expr.split("==")
-        op = "seq"
-    else:
-        return "// Unsupported if"
+# ─── Very small C subset compiler (for the 2 demo programs) ────────────────
+def compile_simple(lines):
+    out=[]
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("//"): continue
 
-    left, right = left.strip(), right.strip()
-    code = ""
-    code += f"lw $t{tRegister}, 0({getVariableRegister(left)})\n"
-    code += f"lw $t{tRegister+1}, 0({getVariableRegister(right)})\n"
-    code += f"{op} $t{tRegister+2}, $t{tRegister}, $t{tRegister+1}\n"
-    code += f"beq $t{tRegister+2}, $zero, AFTER\n"
-    tRegister += 3
-    return code
-
-def compile_c_to_asm(filename):
-    global tRegister
-    with open(filename, "r") as f:
-        lines = f.readlines()
-
-    output = ""
-
-    for line in lines:
-        line = line.strip()
-        if not line or line.startswith("//"):
+        # int x = VAL;
+        m = re.match(r'int\s+(\w+)\s*=\s*([^;]+);', line)
+        if m:
+            var, expr = m.groups()
+            vars_.add(var)
+            out += handle_assignment(var, expr)
             continue
-        if line.startswith("int "):
-            _, var = line.split()
-            var = var.strip(";")
-            output += getInstructionLine(var) + "\n"
-        elif line.startswith("if "):
-            output += getIfStatement(line) + "\n"
-        elif "=" in line:
-            varName, _, expr = line.partition("=")
-            varName = varName.strip()
-            expr = expr.strip().strip(";")
-            if any(op in expr for op in "+-*/"):
-                output += getArithmeticAssignment(line)
-            elif expr.isdigit():
-                output += getAssignmentLinesImmediateValue(expr, varName)
-                tRegister += 1
-            else:
-                output += getAssignmentLinesVariable(expr, varName)
-        elif line.startswith("}"):
-            output += "AFTER:\n"
-        else:
-            pass
 
-    with open("output.asm", "w") as out:
-        out.write(output)
+        # int x;
+        m = re.match(r'int\s+(\w+)\s*;', line)
+        if m:
+            vars_.add(m.group(1))
+            continue
 
+        # assignment or math / shift
+        m = re.match(r'(\w+)\s*=\s*([^;]+);', line)
+        if m:
+            var, expr = m.groups()
+            vars_.add(var)
+            out += handle_assignment(var, expr)
+            continue
+
+        # print(var);
+        m = re.match(r'print\s*\(\s*(\w+)\s*\)\s*;', line)
+        if m:
+            out.append(f"print {m.group(1)}")
+            continue
+
+        # ignore anything else
+    return out
+
+# ─── Main entry ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    compile_c_to_asm("program.c")
+    src = sys.argv[1] if len(sys.argv)>1 else "main.c"
+    dst = sys.argv[2] if len(sys.argv)>2 else "output.asm"
+    with open(src) as f:
+        asm_lines = compile_simple(f.readlines())
+    with open(dst,"w") as o:
+        o.write("\n".join(asm_lines))
+    print("✔ Wrote", dst)
