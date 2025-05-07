@@ -1,108 +1,180 @@
-#!/usr/bin/env python3
-import re, sys
+tRegister = 0
+vars = {}
 
-# ─── Globals ────────────────────────────────────────────────────────────────
-vars_        = set()
-reg_counter  = 0                      # cycle through $t0–$t7
+def getNextTRegister():
+    global tRegister
+    reg = f"$t{tRegister}"
+    tRegister = (tRegister + 1) % 8
+    return reg
 
-def next_reg():
-    global reg_counter
-    r = f"$t{reg_counter}"
-    reg_counter = (reg_counter + 1) & 7
-    return r
+def setVariableRegister(varName, reg):
+    vars[varName] = reg
 
-# ─── Helper: load constant or variable into a fresh register ───────────────
-def load(val):
-    r = next_reg()
+def getVariableRegister(varName):
+    return vars.get(varName, "ERROR")
+
+def getDeclarationLine(varName):
+    reg = getNextTRegister()
+    setVariableRegister(varName, reg)
+    return f"# reserve {varName} in {reg}"
+
+
+def getAssignment(val, varName):
+    reg = getVariableRegister(varName)
     if val.isdigit():
-        return [f"loadi {r}, {val}"], r
-    return [f"loadi {r}, {val}"], r             # treat val as variable name
+        return f"loadi {reg}, {val}\nstorei {reg}, {varName}"
+    elif "%" in val:
+        a, b = val.split("%")
+        a = a.strip()
+        b = b.strip()
+        r1 = getNextTRegister()
+        r2 = getNextTRegister()
+        r3 = getVariableRegister(varName)
+        return (
+            f"loadi {r1}, {a}\n"
+            f"loadi {r2}, {b}\n"
+            f"MOD {r3}, {r1}, {r2}\n"
+            f"storei {r3}, {varName}"
+        )
+    else:
+        src = getVariableRegister(val)
+        temp = getNextTRegister()
+        return f"loadi {temp}, {val}\nstorei {temp}, {varName}"
 
-# ─── Build code for  var = expr  (now supports <<  >>) ─────────────────────
-def handle_assignment(var, expr):
-    out = []
+def parse_condition(expr):
+    # Supported: a % b == 0, a == b, a != b, a < b, a > b
+    tokens = expr.replace("(", "").replace(")", "").split()
+    if "%" in expr:
+        # example: i % 3 == 0
+        a, _, b, op, c = tokens
+        r1 = getNextTRegister()
+        r2 = getNextTRegister()
+        r3 = getNextTRegister()
+        code = [
+            f"loadi {r1}, {a}",
+            f"loadi {r2}, {b}",
+            f"MOD {r3}, {r1}, {r2}"
+        ]
+        if op == "==":
+            code.append(f"BNE {r3}, $zero, SKIP")
+        elif op == "!=":
+            code.append(f"BEQ {r3}, $zero, SKIP")
+        return code
+    elif len(tokens) == 3:
+        a, op, b = tokens
+        r1 = getNextTRegister()
+        r2 = getNextTRegister()
+        r3 = getNextTRegister()
+        code = [
+            f"loadi {r1}, {a}",
+            f"loadi {r2}, {b}"
+        ]
+        if op == "==":
+            code += [f"SUB {r3}, {r1}, {r2}", f"BNE {r3}, $zero, SKIP"]
+        elif op == "!=":
+            code += [f"SUB {r3}, {r1}, {r2}", f"BEQ {r3}, $zero, SKIP"]
+        elif op == "<":
+            code += [f"LT {r3}, {r1}, {r2}", f"BEQ {r3}, $zero, SKIP"]
+        elif op == ">":
+            code += [f"GT {r3}, {r1}, {r2}", f"BEQ {r3}, $zero, SKIP"]
+        return code
+    else:
+        return [f"# Unsupported condition: {expr}"]
 
-    # Shift-left  (A << imm)
-    m = re.match(r'(.+?)<<(.*)', expr)
-    if m:
-        left, amt = m.group(1).strip(), m.group(2).strip()
-        code_src, r_src = load(left)
-        r_dst = next_reg()
-        out += code_src + [f"shiftleft {r_dst}, {r_src}, {amt}",
-                           f"storei {r_dst}, {var}"]
-        return out
+# Main logic
+with open("main.c", "r") as f:
+    lines = [line.strip() for line in f.readlines()]
 
-    # Shift-right (A >> imm)
-    m = re.match(r'(.+?)>>(.*)', expr)
-    if m:
-        left, amt = m.group(1).strip(), m.group(2).strip()
-        code_src, r_src = load(left)
-        r_dst = next_reg()
-        out += code_src + [f"shiftright {r_dst}, {r_src}, {amt}",
-                           f"storei {r_dst}, {var}"]
-        return out
+outputText = ""
+i = 0
+loop_id = 0
+while i < len(lines):
+    line = lines[i]
 
-    # Arithmetic + - * /
-    m = re.match(r'(.+?)([+\-*/])(.+)', expr)
-    if m:
-        lhs, op, rhs = m.group(1).strip(), m.group(2), m.group(3).strip()
-        opmap = {"+":"ADD","-":"SUB","*":"MUL","/":"DIV"}
-        c1,r1 = load(lhs)
-        c2,r2 = load(rhs)
-        r3    = next_reg()
-        out += c1 + c2 + [f"{opmap[op]} {r3}, {r1}, {r2}",
-                          f"storei {r3}, {var}"]
-        return out
+    if line.startswith("int "):
+        line = line.replace("int", "").replace(";", "").strip()
+        if "=" in line:
+            varName, val = [v.strip() for v in line.split("=")]
 
-    # Immediate or var copy
-    c,r = load(expr)
-    out += c + [f"storei {r}, {var}"]
-    return out
+            # Handle immediate shifts: 2 << 2, 4 >> 1
+            if "<<" in val:
+                lhs, rhs = [v.strip() for v in val.split("<<")]
+                reg1 = getNextTRegister()
+                reg2 = getNextTRegister()
+                dest = getNextTRegister()
+                setVariableRegister(varName, dest)
+                outputText += (
+                    f"loadi {reg1}, {lhs}\n"
+                    f"shiftleft {reg2}, {reg1}, {rhs}\n"
+                    f"storei {reg2}, {varName}\n"
+                )
+            elif ">>" in val:
+                lhs, rhs = [v.strip() for v in val.split(">>")]
+                reg1 = getNextTRegister()
+                reg2 = getNextTRegister()
+                dest = getNextTRegister()
+                setVariableRegister(varName, dest)
+                outputText += (
+                    f"loadi {reg1}, {lhs}\n"
+                    f"shiftright {reg2}, {reg1}, {rhs}\n"
+                    f"storei {reg2}, {varName}\n"
+                )
+            elif val.isdigit():
+                reg = getNextTRegister()
+                setVariableRegister(varName, reg)
+                outputText += f"loadi {reg}, {val}\nstorei {reg}, {varName}\n"
 
-# ─── Very small C subset compiler (for the 2 demo programs) ────────────────
-def compile_simple(lines):
-    out=[]
-    for raw in lines:
-        line = raw.strip()
-        if not line or line.startswith("//"): continue
+    elif "=" in line and not line.startswith("for"):
+        parts = line.strip(";").split("=")
+        varName = parts[0].strip()
+        val = parts[1].strip()
+        if "<<" in val:
+            lhs, amt = [v.strip() for v in val.split("<<")]
+            src_reg = getVariableRegister(lhs)
+            dst_reg = getVariableRegister(varName)
+            outputText += f"shiftleft {dst_reg}, {src_reg}, {amt}\nstorei {dst_reg}, {varName}\n"
+        elif ">>" in val:
+            lhs, amt = [v.strip() for v in val.split(">>")]
+            src_reg = getVariableRegister(lhs)
+            dst_reg = getVariableRegister(varName)
+            outputText += f"shiftright {dst_reg}, {src_reg}, {amt}\nstorei {dst_reg}, {varName}\n"
+        elif val.isdigit():
+            outputText += getAssignment(val, varName) + "\n"
+        else:
+            outputText += getAssignment(val, varName) + "\n"
+        outputText += getAssignment(val, var) + "\n"
+        outputText += label + ":\n"
+        outputText += "\n".join(parse_condition(cond.strip())) + "\n"
 
-        # int x = VAL;
-        m = re.match(r'int\s+(\w+)\s*=\s*([^;]+);', line)
-        if m:
-            var, expr = m.groups()
-            vars_.add(var)
-            out += handle_assignment(var, expr)
-            continue
+    elif line.startswith("if"):
+        expr = line[2:].strip("() {")
+        outputText += "\n".join(parse_condition(expr.strip())) + "\n"
 
-        # int x;
-        m = re.match(r'int\s+(\w+)\s*;', line)
-        if m:
-            vars_.add(m.group(1))
-            continue
+    elif line.startswith("else if"):
+        outputText += "SKIP:\n"
+        expr = line[8:].strip("() {")
+        outputText += "\n".join(parse_condition(expr.strip())) + "\n"
 
-        # assignment or math / shift
-        m = re.match(r'(\w+)\s*=\s*([^;]+);', line)
-        if m:
-            var, expr = m.groups()
-            vars_.add(var)
-            out += handle_assignment(var, expr)
-            continue
+    elif line.startswith("else"):
+        outputText += "SKIP:\n"
 
-        # print(var);
-        m = re.match(r'print\s*\(\s*(\w+)\s*\)\s*;', line)
-        if m:
-            out.append(f"print {m.group(1)}")
-            continue
+    elif "printf(" in line:
+        content = line.strip(";").split("printf(")[1].rstrip(")")
+        if '"' in content:
+            text = content.replace('"', '').strip()
+            outputText += f"print {text}\n"
+        else:
+            outputText += f"print {content.strip()}\n"
 
-        # ignore anything else
-    return out
+    elif line.startswith("}"):
+        outputText += "JUMP " + label + "\n"
+        outputText += "SKIP:\n"
+        outputText += end_label + ":\n"
 
-# ─── Main entry ─────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    src = sys.argv[1] if len(sys.argv)>1 else "main.c"
-    dst = sys.argv[2] if len(sys.argv)>2 else "output.asm"
-    with open(src) as f:
-        asm_lines = compile_simple(f.readlines())
-    with open(dst,"w") as o:
-        o.write("\n".join(asm_lines))
-    print("✔ Wrote", dst)
+    i += 1
+
+# Write output
+with open("output.asm", "w") as f:
+    f.write(outputText)
+
+print("✔ Wrote output.asm")
